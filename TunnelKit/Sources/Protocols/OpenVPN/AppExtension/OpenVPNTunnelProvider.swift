@@ -487,6 +487,7 @@ extension OpenVPNTunnelProvider: GenericSocketDelegate {
     
     /// :nodoc:
     public func socketDidBecomeActive(_ socket: GenericSocket) {
+        reconnectCount = 0
         guard let session = session, let producer = socket as? LinkProducer else {
             return
         }
