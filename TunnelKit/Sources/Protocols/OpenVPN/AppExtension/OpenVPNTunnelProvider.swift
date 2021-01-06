@@ -78,8 +78,13 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     /// The number of milliseconds between data count updates. Set to 0 to disable updates (default).
     public var dataCountInterval = 0
     
-    /// A list of public DNS servers to use as fallback when none are provided (defaults to empty dns list).
-    public var fallbackDNSServers = [""]
+    /// A list of public DNS servers to use as fallback when none are provided (defaults to CloudFlare).
+    public var fallbackDNSServers = [
+        "1.1.1.1",
+        "1.0.0.1",
+        "2606:4700:4700::1111",
+        "2606:4700:4700::1001"
+    ]
     
     // MARK: Constants
     
@@ -123,6 +128,15 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     
     private var isCountingData = false
     
+    private var shouldReconnect = false
+
+    // Bookkeeping and path monitor for wait and reconnect
+    private var shouldReconnectWhenNetworkBecomesAvailable = false
+    private var reconnectionPathMonitor: AnyObject?
+    
+    private var maxReconnectCount = 24   //最大重连次数
+    private var netWorkSettingFinished = false //NetWorkSetting标志位
+    private var reconnectCount = 0
     // MARK: NEPacketTunnelProvider (XPC queue)
     
     open override var reasserting: Bool {
@@ -306,7 +320,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     
     // MARK: Connection (tunnel queue)
     
-    private func connectTunnel(upgradedSocket: GenericSocket? = nil, preferredAddress: String? = nil) {
+    private func connectTunnel(upgradedSocket: GenericSocket? = nil) {
         log.info("Creating link session")
         
         // reuse upgraded socket
@@ -316,7 +330,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
             return
         }
         
-        strategy.createSocket(from: self, timeout: dnsTimeout, preferredAddress: preferredAddress, queue: tunnelQueue) { (socket, error) in
+        strategy.createSocket(from: self, timeout: dnsTimeout, queue: tunnelQueue) { (socket, error) in
             guard let socket = socket else {
                 self.disposeTunnel(error: error)
                 return
@@ -336,7 +350,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     }
     
     private func finishTunnelDisconnection(error: Error?) {
-        if let session = session, !(reasserting && session.canRebindLink()) {
+        if let session = session, !(shouldReconnect && session.canRebindLink()) {
             session.cleanup()
         }
         
@@ -405,6 +419,51 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
         }
         defaults?.dataCountArray = [dataCount.0, dataCount.1]
     }
+
+    deinit {
+        if #available(iOS 12, macOS 10.14, *) {
+            tearDownReconnectionPathMonitor()
+        }
+    }
+}
+
+@available(iOS 12, macOS 10.14, *)
+extension OpenVPNTunnelProvider {
+
+    // MARK: Wait and reconnect
+
+    // If reconnecting based on path monitor is enabled, a NWPathMonitor is used
+    // to trigger reconnection to recover from a link failure or network change.
+    public func setReconnectBasedOnPathMonitor(enabled: Bool) {
+        if enabled {
+            setUpReconnectionPathMonitor()
+        } else {
+            tearDownReconnectionPathMonitor()
+        }
+    }
+
+    // Setup reconnectionPathMonitor to reconnect (if asked to) when network comes up next
+    public func setUpReconnectionPathMonitor() {
+        let pathMonitor = NWPathMonitor()
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            log.debug("reconnectionPathMonitor path status = \(path.status), interfaces = \(path.availableInterfaces)")
+            if path.status == .satisfied && self.shouldReconnectWhenNetworkBecomesAvailable {
+                self.shouldReconnectWhenNetworkBecomesAvailable = false
+                self.connectTunnel()
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue.main)
+        reconnectionPathMonitor = pathMonitor
+    }
+
+    // Tear down and deref reconnectionPathMonitor
+    private func tearDownReconnectionPathMonitor() {
+        if let pathMonitor = reconnectionPathMonitor as? NWPathMonitor {
+            pathMonitor.cancel()
+        }
+        reconnectionPathMonitor = nil
+    }
 }
 
 extension OpenVPNTunnelProvider: GenericSocketDelegate {
@@ -414,12 +473,12 @@ extension OpenVPNTunnelProvider: GenericSocketDelegate {
     /// :nodoc:
     public func socketDidTimeout(_ socket: GenericSocket) {
         log.debug("Socket timed out waiting for activity, cancelling...")
-        reasserting = true
+        shouldReconnect = true
         socket.shutdown()
 
         // fallback: TCP connection timeout suggests falling back
         if let _ = socket as? NETCPSocket {
-            guard tryNextProtocol() else {
+            guard tryNextEndpoint() else {
                 // disposeTunnel
                 return
             }
@@ -466,31 +525,71 @@ extension OpenVPNTunnelProvider: GenericSocketDelegate {
 
         // fallback: UDP is connection-less, treat negotiation timeout as socket timeout
         if didTimeoutNegotiation {
-            guard tryNextProtocol() else {
+            guard tryNextEndpoint() else {
                 // disposeTunnel
                 return
             }
         }
 
+        /*
         // reconnect?
-        if reasserting {
+        if shouldReconnect {
+
+            if #available(iOS 12, macOS 10.14, *) {
+                if shutdownError as? ProviderError == .networkChanged,
+                    let pathMonitor = self.reconnectionPathMonitor as? NWPathMonitor,
+                    pathMonitor.currentPath.status == .unsatisfied {
+                    // If the network path is in the process of changing, and we don't currently
+                    // have a path yet, wait till a path becomes available and then reconnect.
+                    log.debug("Tunnel will reconnect shortly, after a network interface becomes available")
+                    self.shouldReconnectWhenNetworkBecomesAvailable = true
+                    self.reasserting = true
+                    return
+                }
+            }
+
             log.debug("Disconnection is recoverable, tunnel will reconnect in \(reconnectionDelay) milliseconds...")
             tunnelQueue.schedule(after: .milliseconds(reconnectionDelay)) {
-                log.debug("Tunnel is about to reconnect...")
 
-                // give up if reasserting cleared in the meantime
-                guard self.reasserting else {
-                    log.warning("Reasserting flag was cleared in the meantime")
+                // give up if shouldReconnect cleared in the meantime
+                guard self.shouldReconnect else {
+                    log.warning("Reconnection flag was cleared in the meantime")
                     return
                 }
 
-                self.connectTunnel(upgradedSocket: upgradedSocket, preferredAddress: socket.remoteAddress)
+                log.debug("Tunnel is about to reconnect...")
+                self.reasserting = true
+                self.connectTunnel(upgradedSocket: upgradedSocket)
             }
+            return
+        }
+
+        // reconnect later
+        if self.reconnectionPathMonitor != nil && (shutdownError as? OpenVPNError == .failedLinkWrite) {
+            log.debug("Disconnection can't be recovered at present, tunnel will reconnect when network becomes available")
+            self.shouldReconnectWhenNetworkBecomesAvailable = true
+            self.reasserting = true
             return
         }
 
         // shut down
         disposeTunnel(error: shutdownError)
+        
+        */
+        if( self.reconnectCount>maxReconnectCount){
+            // shut down
+            disposeTunnel(error: shutdownError)
+
+        }else{
+            log.debug("Disconnection is recoverable, tunnel will reconnect in \(reconnectionDelay) milliseconds...")
+            tunnelQueue.schedule(after: .milliseconds(reconnectionDelay)) {
+                log.debug("Tunnel is about to reconnect...")
+                self.reasserting = true
+                self.reconnectCount = self.reconnectCount+1
+                self.connectTunnel(upgradedSocket: upgradedSocket)
+            }
+
+        }
     }
     
     /// :nodoc:
@@ -544,40 +643,56 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
                 log.info("\t\tBypass domains: \(bypass.maskedDescription)")
             }
         }
-
-        bringNetworkUp(remoteAddress: remoteAddress, localOptions: session.configuration, options: options) { (error) in
-
-            // FIXME: XPC queue
-            
+        if(self.netWorkSettingFinished){
             self.reasserting = false
-            
-            if let error = error {
-                log.error("Failed to configure tunnel: \(error)")
-                self.pendingStartHandler?(error)
-                self.pendingStartHandler = nil
-                return
-            }
-            
             log.info("Tunnel interface is now UP")
             
-            session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow, isIPv6: options.ipv6 != nil))
+            session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow))
 
             self.pendingStartHandler?(nil)
             self.pendingStartHandler = nil
         }
+        else {
+            bringNetworkUp(remoteAddress: remoteAddress, localOptions: session.configuration, options: options) { (error) in
+
+                // FIXME: XPC queue
+                
+                self.reasserting = false
+                
+                if let error = error {
+                    log.error("Failed to configure tunnel: \(error)")
+                    self.pendingStartHandler?(error)
+                    self.pendingStartHandler = nil
+                    return
+                }
+                
+                log.info("Tunnel interface is now UP")
+                
+                session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow))
+
+                self.pendingStartHandler?(nil)
+//                self.pendingStartHandler = nil
+                self.netWorkSettingFinished = true
+            }
+        }
+  
 
         isCountingData = true
         refreshDataCount()
     }
     
     /// :nodoc:
-    public func sessionDidStop(_: OpenVPNSession, shouldReconnect: Bool) {
-        log.info("Session did stop")
+    public func sessionDidStop(_: OpenVPNSession, withError error: Error?, shouldReconnect: Bool) {
+        if let error = error {
+            log.error("Session did stop with error: \(error)")
+        } else {
+            log.info("Session did stop")
+        }
 
         isCountingData = false
         refreshDataCount()
 
-        reasserting = shouldReconnect
+        self.shouldReconnect = shouldReconnect
         socket?.shutdown()
     }
     
@@ -658,16 +773,7 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
             return
         }
         
-        var dnsServers = [String]()
-        //First check for dnsServers from the ovpn session configuration
-        if let sessionConfigurationDnsServers = cfg.sessionConfiguration.dnsServers, !sessionConfigurationDnsServers.isEmpty {
-            dnsServers = sessionConfigurationDnsServers
-        } else {
-            //If empty, use the dnsServers provided from the tunnel
-            if let servers = options.dnsServers {
-                dnsServers = servers
-            }
-        }
+        var dnsServers = cfg.sessionConfiguration.dnsServers ?? options.dnsServers ?? []
 
         // fall back
         if !dnsServers.isEmpty {
@@ -738,7 +844,7 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
                 let gateway = table.defaultGateway4()?.gateway(),
                 let route = table.broadestRoute4(matchingDestination: gateway) {
 
-                route.partitioned().forEach {
+                route.partitioned()?.forEach {
                     let destination = $0.network()
                     guard let netmask = $0.networkMask() else {
                         return
@@ -755,7 +861,7 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
                 let gateway = table.defaultGateway6()?.gateway(),
                 let route = table.broadestRoute6(matchingDestination: gateway) {
 
-                route.partitioned().forEach {
+                route.partitioned()?.forEach {
                     let destination = $0.network()
                     let prefix = $0.prefix()
                     
@@ -780,8 +886,8 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
 }
 
 extension OpenVPNTunnelProvider {
-    private func tryNextProtocol() -> Bool {
-        guard strategy.tryNextProtocol() else {
+    private func tryNextEndpoint() -> Bool {
+        guard strategy.tryNextEndpoint() else {
             disposeTunnel(error: ProviderError.exhaustedProtocols)
             return false
         }
@@ -847,7 +953,7 @@ extension OpenVPNTunnelProvider {
             case .tlsCertificateAuthority, .tlsClientCertificate, .tlsClientKey:
                 return .tlsInitialization
                 
-            case .tlsServerCertificate, .tlsServerEKU:
+            case .tlsServerCertificate, .tlsServerEKU, .tlsServerHost:
                 return .tlsServerVerification
                 
             case .tlsHandshake:
@@ -881,6 +987,9 @@ extension OpenVPNTunnelProvider {
                 
             case .noRouting:
                 return .routing
+                
+            case .serverShutdown:
+                return .serverShutdown
 
             default:
                 return .unexpectedReply

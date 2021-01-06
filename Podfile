@@ -1,9 +1,10 @@
-source 'https://github.com/CocoaPods/Specs.git'
+#source 'https://github.com/CocoaPods/Specs.git'
+source 'https://cdn.cocoapods.org'
 use_frameworks!
 
 def shared_pods
     pod 'SwiftyBeaver'
-    pod 'OpenSSL-Apple', '~> 1.1.1d.5a'
+    pod 'OpenSSL-Apple', '~> 1.1.1g.6'
     #pod 'OpenSSL-Apple', :path => '../../personal/openssl-apple'
 end
 

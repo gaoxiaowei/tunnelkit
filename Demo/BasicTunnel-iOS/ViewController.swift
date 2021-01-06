@@ -76,32 +76,48 @@ YDQ8z9v+DMO6iwyIDRiU
 """)
 
 extension ViewController {
-    private static let appGroup = "group.com.algoritmico.ios.demo.BasicTunnel"
+    private static let appGroup = "group.com.acnet.ios.demo.BasicTunnel"
     
-    private static let tunnelIdentifier = "com.algoritmico.ios.demo.BasicTunnel.BasicTunnelExtension"
+    private static let tunnelIdentifier = "com.acnet.ios.demo.BasicTunnel.Extension"
     
     private func makeProtocol() -> NETunnelProviderProtocol {
-        let server = textServer.text!
-        let domain = textDomain.text!
+        let path = Bundle.main.path(forResource:"45_63_58_42", ofType:"ovpn")!
+//        let path = Bundle.main.path(forResource:"master_client", ofType:"ovpn")!
         
-        let hostname = ((domain == "") ? server : [server, domain].joined(separator: "."))
-        let port = UInt16(textPort.text!)!
-        let credentials = OpenVPN.Credentials(textUsername.text!, textPassword.text!)
+        let url = URL(fileURLWithPath: path)
+       
+        let parsingResult: OpenVPN.ConfigurationParser.Result
+        parsingResult = try! OpenVPN.ConfigurationParser.parsed(fromURL: url)
         
-        var sessionBuilder = OpenVPN.ConfigurationBuilder()
-        sessionBuilder.ca = ca
-        sessionBuilder.cipher = .aes128cbc
-        sessionBuilder.digest = .sha1
-        sessionBuilder.compressionFraming = .compLZO
-        sessionBuilder.renegotiatesAfter = nil
-        sessionBuilder.hostname = hostname
-        let socketType: SocketType = switchTCP.isOn ? .tcp : .udp
-        sessionBuilder.endpointProtocols = [EndpointProtocol(socketType, port)]
-        sessionBuilder.usesPIAPatches = true
-        var builder = OpenVPNTunnelProvider.ConfigurationBuilder(sessionConfiguration: sessionBuilder.build())
-        builder.mtu = 1350
+        var builder = OpenVPNTunnelProvider.ConfigurationBuilder(sessionConfiguration: parsingResult.configuration)
+        
+        builder.mtu = 1250
         builder.shouldDebug = true
-        builder.masksPrivateData = false
+        builder.debugLogFormat = "$DHH:mm:ss$d - $M"
+        let credentials : OpenVPN.Credentials?
+        credentials = nil
+        
+//        let server = textServer.text!
+//        let domain = textDomain.text!
+//
+//        let hostname = ((domain == "") ? server : [server, domain].joined(separator: "."))
+//        let port = UInt16(textPort.text!)!
+//        let credentials = OpenVPN.Credentials(textUsername.text!, textPassword.text!)
+//
+//        var sessionBuilder = OpenVPN.ConfigurationBuilder()
+//        sessionBuilder.ca = ca
+//        sessionBuilder.cipher = .aes128cbc
+//        sessionBuilder.digest = .sha1
+//        sessionBuilder.compressionFraming = .compLZO
+//        sessionBuilder.renegotiatesAfter = nil
+//        sessionBuilder.hostname = hostname
+//        let socketType: SocketType = switchTCP.isOn ? .tcp : .udp
+//        sessionBuilder.endpointProtocols = [EndpointProtocol(socketType, port)]
+//        sessionBuilder.usesPIAPatches = true
+//        var builder = OpenVPNTunnelProvider.ConfigurationBuilder(sessionConfiguration: sessionBuilder.build())
+//        builder.mtu = 1350
+//        builder.shouldDebug = true
+//        builder.masksPrivateData = false
         
         let configuration = builder.build()
         return try! configuration.generatedTunnelProtocol(
