@@ -340,13 +340,15 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     }
     
     private func connectTunnel(via socket: GenericSocket) {
-        log.info("Will connect to \(socket)")
-        cfg.clearLastError(in: appGroup)
+         setTunnelNetworkSettings(nil) { (error) in
+            log.info("Will connect to \(socket)")
+            self.cfg.clearLastError(in: self.appGroup)
 
-        log.debug("Socket type is \(type(of: socket))")
-        self.socket = socket
-        self.socket?.delegate = self
-        self.socket?.observe(queue: tunnelQueue, activeTimeout: socketTimeout)
+            log.debug("Socket type is \(type(of: socket))")
+            self.socket = socket
+            self.socket?.delegate = self
+            self.socket?.observe(queue: self.tunnelQueue, activeTimeout: self.socketTimeout)
+        }
     }
     
     private func finishTunnelDisconnection(error: Error?) {
@@ -644,38 +646,27 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
                 log.info("\t\tBypass domains: \(bypass.maskedDescription)")
             }
         }
-        if(self.netWorkSettingFinished){
+        bringNetworkUp(remoteAddress: remoteAddress, localOptions: session.configuration, options: options) { (error) in
+            
+            // FIXME: XPC queue
+            
             self.reasserting = false
+            
+            if let error = error {
+                log.error("Failed to configure tunnel: \(error)")
+                self.pendingStartHandler?(error)
+                self.pendingStartHandler = nil
+                return
+            }
+            
             log.info("Tunnel interface is now UP")
             
             session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow))
-
+            
             self.pendingStartHandler?(nil)
-            self.pendingStartHandler = nil
+            //self.pendingStartHandler = nil
         }
-        else {
-            bringNetworkUp(remoteAddress: remoteAddress, localOptions: session.configuration, options: options) { (error) in
-
-                // FIXME: XPC queue
-                
-                self.reasserting = false
-                
-                if let error = error {
-                    log.error("Failed to configure tunnel: \(error)")
-                    self.pendingStartHandler?(error)
-                    self.pendingStartHandler = nil
-                    return
-                }
-                
-                log.info("Tunnel interface is now UP")
-                
-                session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow))
-
-                self.pendingStartHandler?(nil)
-//                self.pendingStartHandler = nil
-                self.netWorkSettingFinished = true
-            }
-        }
+    
   
 
         isCountingData = true
