@@ -135,7 +135,6 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     private var reconnectionPathMonitor: AnyObject?
     
     private var maxReconnectCount = 24   //最大重连次数
-    private var netWorkSettingFinished = false //NetWorkSetting标志位
     private var reconnectCount = 0
     // MARK: NEPacketTunnelProvider (XPC queue)
     
