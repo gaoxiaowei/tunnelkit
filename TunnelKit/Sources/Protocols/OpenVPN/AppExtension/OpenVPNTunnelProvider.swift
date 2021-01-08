@@ -339,15 +339,13 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     }
     
     private func connectTunnel(via socket: GenericSocket) {
-         setTunnelNetworkSettings(nil) { (error) in
-            log.info("Will connect to \(socket)")
-            self.cfg.clearLastError(in: self.appGroup)
-
-            log.debug("Socket type is \(type(of: socket))")
-            self.socket = socket
-            self.socket?.delegate = self
-            self.socket?.observe(queue: self.tunnelQueue, activeTimeout: self.socketTimeout)
-        }
+        log.info("Will connect to \(socket)")
+        self.cfg.clearLastError(in: self.appGroup)
+        
+        log.debug("Socket type is \(type(of: socket))")
+        self.socket = socket
+        self.socket?.delegate = self
+        self.socket?.observe(queue: self.tunnelQueue, activeTimeout: self.socketTimeout)
     }
     
     private func finishTunnelDisconnection(error: Error?) {
@@ -583,14 +581,16 @@ extension OpenVPNTunnelProvider: GenericSocketDelegate {
             disposeTunnel(error: shutdownError)
 
         }else{
-            log.debug("Disconnection is recoverable, tunnel will reconnect in \(reconnectionDelay) milliseconds...")
-            tunnelQueue.schedule(after: .milliseconds(reconnectionDelay)) {
-                log.debug("Tunnel is about to reconnect...")
-                self.reasserting = true
-                self.reconnectCount = self.reconnectCount+1
-                self.connectTunnel(upgradedSocket: upgradedSocket)
+            setTunnelNetworkSettings(nil) { (error) in
+                log.debug("Disconnection is recoverable, tunnel will reconnect in \(self.reconnectionDelay) milliseconds...")
+                self.tunnelQueue.schedule(after: .milliseconds(self.reconnectionDelay)) {
+                    log.debug("Tunnel is about to reconnect...")
+                    self.reasserting = true
+                    self.reconnectCount = self.reconnectCount+1
+                    self.connectTunnel(upgradedSocket: upgradedSocket)
+                }
+             
             }
-
         }
     }
     
